@@ -36,17 +36,19 @@ class EnvironmentDataApplet : public Applet, public MeshModule
         // all of those entries are optional
         static constexpr float FLOAT_VALUE_UNKNOWN = -1000;
         NodeNum nodeNum = 0;
-        float temperature = FLOAT_VALUE_UNKNOWN;
-        float relHumidity = FLOAT_VALUE_UNKNOWN;
-        float baroPressure = FLOAT_VALUE_UNKNOWN;
-        float gasResistance = FLOAT_VALUE_UNKNOWN; // in mOhm
-        int iaq = -1;
+        bool isFavorite = false;
+        // keep our own metrics (TODO: maybe not necessary?)
+        meshtastic_EnvironmentMetrics metrics = {};
+        // TODO: special handling for CO2 - not stored in NodeDB EnvironmentMetrics, but only delivered as a variant of telemetry
+        //bool has_co2;
+        //uint32_t co2;
     };
 
   public:
     EnvironmentDataApplet();
 
     void onActivate() override;
+    void onDeactivate() override;
     void onRender(bool full) override;
 
     bool wantPacket(const meshtastic_MeshPacket *p) override;
@@ -60,7 +62,7 @@ class EnvironmentDataApplet : public Applet, public MeshModule
 
     void updateCard(NodeNum from, const meshtastic_EnvironmentMetrics& metrics);
 
-    std::deque<EnvCardInfo> cards; // Cards to be rendered.
+    std::list<EnvCardInfo> cards; // Cards to be rendered.
 
   private:
     // Card Dimensions

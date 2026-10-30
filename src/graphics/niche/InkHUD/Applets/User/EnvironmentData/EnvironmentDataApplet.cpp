@@ -11,14 +11,15 @@ using namespace NicheGraphics;
 
 InkHUD::EnvironmentDataApplet::EnvironmentDataApplet() : MeshModule("Environment Data")
 {
-    // we only display data intended for us
+    // we only display data intended for us - don't spy on others ;)
     // MeshModule::isPromiscuous = true;
-    // also display our own telemetry
-    MeshModule::loopbackOk = true;
 }
 
 void InkHUD::EnvironmentDataApplet::onActivate()
 {
+    // also display our own telemetry
+    MeshModule::loopbackOk = true;
+
     // initialize our cards to show the telemetry Meshtastic already knows about
 
     std::deque<std::pair<NodeNum, meshtastic_EnvironmentMetrics>> lastNodesWithEnvData;
@@ -32,7 +33,7 @@ void InkHUD::EnvironmentDataApplet::onActivate()
             lastNodesWithEnvData.emplace_back(n->num, env);
     }
 
-    LOG_INFO("Environment Data initialized: %d nodes of %d with telemetry from NodeDB", this->MeshModule::name, 
+    LOG_INFO("%s initialized: %d nodes of %d with telemetry from NodeDB", this->MeshModule::name, 
         lastNodesWithEnvData.size(), nodeDB->getNumMeshNodes());
 
     // process all found nodes last to first because we insert them at the top
@@ -41,12 +42,17 @@ void InkHUD::EnvironmentDataApplet::onActivate()
     }
 }
 
+void InkHUD::EnvironmentDataApplet::onDeactivate()
+{
+    // reduce packets received
+    MeshModule::loopbackOk = false;
+}
+
 // Do we want to process this packet with handleReceived()?
 bool InkHUD::EnvironmentDataApplet::wantPacket(const meshtastic_MeshPacket *p)
 {
-    // Only interested if: TODO: do we get our own telemetry this way?
+    // Only interested in telemetry
     return isActive()                                                  // Applet is active
-           //&& !isFromUs(p)                                             // Packet is incoming (not outgoing)
            && p->decoded.portnum == meshtastic_PortNum_TELEMETRY_APP;  // and telemetry
 }
 
@@ -81,55 +87,101 @@ ProcessMessage InkHUD::EnvironmentDataApplet::handleReceived(const meshtastic_Me
     
 void InkHUD::EnvironmentDataApplet::updateCard(NodeNum from, const meshtastic_EnvironmentMetrics &metrics)
 {
-    EnvCardInfo c;
-    c.nodeNum = from;
+    // we build a new EnvCardInfo here and discard the previous one
+    EnvCardInfo newCard;
+    newCard.nodeNum = from;
 
-    NodeNum firstNodeNum = 0;
-    if (! cards.empty()) {
-        firstNodeNum = cards.at(0).nodeNum;
-    }
-
-    EnvCardInfo previous;
-    // check whether we already have data about this node
+    EnvCardInfo previousCard;
+    int previousPosition = -1; // index of previous card (if found)
+    int pos = 0;
+    // check whether we already have data about this node and remove it from list
     for (auto it = cards.begin(); it != cards.end(); ++it) {
-        if (it->nodeNum == c.nodeNum) {
-            previous = *it;
+        if (it->nodeNum == newCard.nodeNum) {
+            previousCard = *it;
+            previousPosition = pos;
             // remove - we'll reinsert below
             cards.erase(it);
             break;
         }
+        ++pos;
     }
 
-    boolean needsUpdate = firstNodeNum != previous.nodeNum;
+    meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(from);
+    if (! node) {
+        // shouldn't happen if we just received a packet, but prevent NULL dereference
+        if (previousPosition >= 0) {
+            requestUpdate();
+        }
+        return;
+    }
 
-    // use m.has_temperature / m.temperature, etc.  
+    newCard.isFavorite = nodeInfoLiteIsFavorite(node) || (from == nodeDB->getNodeNum());
+
+    std::string longName; // only used for logging right now
+    if (nodeInfoLiteHasUser(node))
+        longName = parse(node->long_name); // Found in nodeDB
+    else {
+        // Not found in nodeDB, show a hex nodeid instead
+        longName = hexifyNodeNum(from);
+    }
+
+    LOG_INFO("%s processing telemetry from %s %s", this->MeshModule::name, longName, newCard.isFavorite ? " (favorite)" : "");
+    boolean needsUpdate = (previousCard.nodeNum != 0) || (previousCard.isFavorite != newCard.isFavorite);
+    const meshtastic_EnvironmentMetrics &previousMetrics = previousCard.metrics;
+    
+    // use m.has_temperature / m.temperature, etc. to copy all metrics relevant to us to new card
     if (metrics.has_temperature) {
-        c.temperature = metrics.temperature;
-        needsUpdate |= (previous.temperature != c.temperature);
+        newCard.metrics.temperature = metrics.temperature;
+        newCard.metrics.has_temperature = true;
+        needsUpdate |= (previousMetrics.temperature != newCard.metrics.temperature);
     }
     if (metrics.has_relative_humidity) {
-        c.relHumidity = metrics.relative_humidity;
-        needsUpdate |= (previous.relHumidity != c.relHumidity);
+        newCard.metrics.relative_humidity = metrics.relative_humidity;
+        newCard.metrics.has_relative_humidity = true;
+        needsUpdate |= (previousMetrics.relative_humidity != newCard.metrics.relative_humidity);
     }
     if (metrics.has_barometric_pressure) {
-        c.baroPressure = metrics.barometric_pressure;
-        needsUpdate |= (previous.baroPressure != c.baroPressure);
+        newCard.metrics.barometric_pressure = metrics.barometric_pressure;
+        newCard.metrics.has_barometric_pressure = true;
+        needsUpdate |= (previousMetrics.barometric_pressure != newCard.metrics.barometric_pressure);
     }
     if (metrics.has_gas_resistance) {
-        c.gasResistance = metrics.gas_resistance;
-        needsUpdate |= (previous.gasResistance != c.gasResistance);
+        newCard.metrics.has_gas_resistance = metrics.gas_resistance;
+        newCard.metrics.has_gas_resistance = true;
+        needsUpdate |= (previousMetrics.has_gas_resistance != newCard.metrics.has_gas_resistance);
     }
     if (metrics.has_iaq) {
-        c.iaq = metrics.iaq;
-        needsUpdate |= (previous.iaq != c.iaq);
+        newCard.metrics.iaq = metrics.iaq;
+        newCard.metrics.has_iaq = true;
+        needsUpdate |= (previousMetrics.iaq != newCard.metrics.iaq);
     }
 
-    cards.push_front(c);                                  // Store this CardInfo
-    cards.resize(min(maxCards(), (uint8_t)cards.size())); // Don't keep more cards than we could *ever* fit on screen
-    cards.shrink_to_fit();
+    // look for correct position of card
+    // favorites first (last seen first), then non-favorites
+    if (newCard.isFavorite) {
+        LOG_INFO("%s putting favorite %s on top", this->MeshModule::name, longName);
+        cards.push_front(newCard); // Store this CardInfo
+    } else {
+        pos = 0;
+        auto it = cards.begin();
+        // skip all favorites
+        while (it != cards.end() && it->isFavorite) {
+            ++it;
+            ++pos;
+        }
+        LOG_INFO("%s inserting updated card for %s at pos. %d", this->MeshModule::name, longName, pos);
+        // insert after last favorite (which might be last card too)
+        cards.insert(it, newCard);
+        needsUpdate |= (pos != previousPosition);
+    }
+
+    if (cards.size() > maxCards()) {
+        LOG_INFO("%s resizing cards cache to %d", this->MeshModule::name, maxCards());
+        cards.resize(maxCards()); // Don't keep more cards than we could *ever* fit on screen
+    }
 
     if (needsUpdate) {
-        requestAutoshow(); // TODO: do we want this?
+        requestAutoshow(); // user decides anyway
         requestUpdate();
     }
 
@@ -255,21 +307,21 @@ void InkHUD::EnvironmentDataApplet::onRender(bool full)
             longName = hexifyNodeNum(nodeNum);
         }
 
-        if (card->temperature != EnvCardInfo::FLOAT_VALUE_UNKNOWN) {
-            tempEtc += String(card->temperature, 1) + "C";
+        if (card->metrics.has_temperature) {
+            tempEtc += String(card->metrics.temperature, 1) + "C";
         }
-        if (card->relHumidity != EnvCardInfo::FLOAT_VALUE_UNKNOWN) {
+        if (card->metrics.has_relative_humidity) {
             if (tempEtc.length() > 0) { tempEtc += " "; }
-            tempEtc += String(card->relHumidity) + "%";
+            tempEtc += String(card->metrics.relative_humidity, 1) + "%";
         }
-        if (card->baroPressure != EnvCardInfo::FLOAT_VALUE_UNKNOWN) {
+        if (card->metrics.has_barometric_pressure) {
             if (tempEtc.length() > 0) { tempEtc += " "; }
-            tempEtc += String(card->baroPressure, 1) + "hPa";
+            tempEtc += String(card->metrics.barometric_pressure, 1) + "hPa";
         }
 
         // IAQ
-        if (card->iaq >= 0) {
-            iaq = "IAQ "+to_string(card->iaq);
+        if (card->metrics.has_iaq) {
+            iaq = "IAQ "+to_string(card->metrics.iaq);
         }
 
         // Draw the info
@@ -314,7 +366,7 @@ void InkHUD::EnvironmentDataApplet::onRender(bool full)
 
         // Draw separator between cards
         const int16_t separatorY = cardTopY + cardH - 1;
-        if (separatorY < height() - 1 && (card + 1) != cards.end()) {
+        if (separatorY < height() - 1) {
             for (int16_t xSep = 0; xSep < width(); xSep += 2)
                 drawPixel(xSep, separatorY, BLACK);
         }
