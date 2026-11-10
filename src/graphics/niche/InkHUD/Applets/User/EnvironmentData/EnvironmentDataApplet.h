@@ -32,16 +32,33 @@ class EnvironmentDataApplet : public Applet, public MeshModule
   protected:
     // Info needed to draw a node card to the list
     // - generated each time we hear a node
-    struct EnvCardInfo {
-        // all of those entries are optional
-        static constexpr float FLOAT_VALUE_UNKNOWN = -1000;
+    class EnvCardInfo {
+      public:
+        EnvCardInfo();
+        EnvCardInfo(NodeNum node);
+        // update this card with given metrics
+        // return true if there where changes
+        bool mergeTelemetry(const meshtastic_Telemetry &telemetry);
+        // if we got EnvironmentMetrics already
+        bool mergeEnvMetrics(const meshtastic_EnvironmentMetrics &metrics);
+        void logDebug();
         NodeNum nodeNum = 0;
         bool isFavorite = false;
-        // keep our own metrics (TODO: maybe not necessary?)
-        meshtastic_EnvironmentMetrics metrics = {};
-        // TODO: special handling for CO2 - not stored in NodeDB EnvironmentMetrics, but only delivered as a variant of telemetry
-        //bool has_co2;
-        //uint32_t co2;
+        // we partly duplicate meshtastic_EnvironmentMetrics here
+        bool has_temperature = false;
+        float temperature;
+        bool has_relative_humidity = false;
+        float relative_humidity;
+        bool has_barometric_pressure = false;
+        float barometric_pressure;
+        bool has_gas_resistance = false;
+        float gas_resistance;
+        bool has_iaq = false;
+        uint16_t iaq;
+        bool has_co2 = false;
+        uint32_t co2;
+        bool has_pm_voc_idx = false;
+        float pm_voc_idx;
     };
 
   public:
@@ -60,7 +77,7 @@ class EnvironmentDataApplet : public Applet, public MeshModule
 
     uint8_t maxCards(); // Max number of cards which could ever fit on screen
 
-    void updateCard(NodeNum from, const meshtastic_EnvironmentMetrics& metrics);
+    void updateCard(NodeNum from, const meshtastic_Telemetry& telemetry);
 
     std::list<EnvCardInfo> cards; // Cards to be rendered.
 

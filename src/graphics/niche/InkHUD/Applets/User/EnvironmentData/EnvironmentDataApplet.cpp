@@ -15,22 +15,107 @@ InkHUD::EnvironmentDataApplet::EnvironmentDataApplet() : MeshModule("Environment
     // MeshModule::isPromiscuous = true;
 }
 
+InkHUD::EnvironmentDataApplet::EnvironmentDataApplet::EnvCardInfo::EnvCardInfo() {
+}
+
+InkHUD::EnvironmentDataApplet::EnvironmentDataApplet::EnvCardInfo::EnvCardInfo(NodeNum node) : nodeNum(node)
+{
+}
+
+// since air quality is different from EnvironmentMetrics, we need to use this
+bool InkHUD::EnvironmentDataApplet::EnvironmentDataApplet::EnvCardInfo::mergeTelemetry(
+    const meshtastic_Telemetry &telemetry
+)
+{
+    bool changed = false;
+
+    if (telemetry.which_variant == meshtastic_Telemetry_environment_metrics_tag) {
+        return mergeEnvMetrics(telemetry.variant.environment_metrics);
+    } else if (telemetry.which_variant == meshtastic_Telemetry_air_quality_metrics_tag) {
+        const meshtastic_AirQualityMetrics &metrics = telemetry.variant.air_quality_metrics;
+        changed |= this->has_co2 != metrics.has_co2;
+        if (metrics.has_co2) {
+            changed |= this->co2 != metrics.co2;
+            this->co2 = metrics.co2;
+            this->has_co2 = true;
+        }
+        if (metrics.has_pm_voc_idx) {
+            changed |= this->pm_voc_idx != metrics.pm_voc_idx;
+            this->pm_voc_idx = metrics.pm_voc_idx;
+            this->has_pm_voc_idx = true;
+        }
+    }
+    return changed;
+}
+
+bool InkHUD::EnvironmentDataApplet::EnvironmentDataApplet::EnvCardInfo::mergeEnvMetrics(
+    const meshtastic_EnvironmentMetrics &metrics
+)
+{
+    bool changed = false;
+    changed |= this->has_barometric_pressure != metrics.has_barometric_pressure;
+    if (metrics.has_barometric_pressure) {
+        changed |= this->barometric_pressure != metrics.barometric_pressure;
+        this->barometric_pressure = metrics.barometric_pressure;
+        this->has_barometric_pressure = true;
+    }
+    changed |= this->has_temperature != metrics.has_temperature;
+    if (metrics.has_temperature) {
+        changed |= this->temperature != metrics.temperature;
+        this->temperature = metrics.temperature;
+        this->has_temperature = true;
+    }
+    changed |= this->has_relative_humidity != metrics.has_relative_humidity;
+    if (metrics.has_relative_humidity) {
+        changed |= this->relative_humidity != metrics.relative_humidity;
+        this->relative_humidity = metrics.relative_humidity;
+        this->has_relative_humidity = true;
+    }
+    changed |= this->has_gas_resistance != metrics.has_gas_resistance;
+    if (metrics.has_gas_resistance) {
+        changed |= this->gas_resistance != metrics.gas_resistance;
+        this->gas_resistance = metrics.gas_resistance;
+        this->has_gas_resistance = true;
+    }
+    changed |= this->has_iaq != metrics.has_iaq;
+    if (metrics.has_iaq) {
+        changed |= this->iaq != metrics.iaq;
+        this->iaq = metrics.iaq;
+        this->has_iaq = true;
+    }
+
+    return changed;
+}
+
+void InkHUD::EnvironmentDataApplet::EnvironmentDataApplet::EnvCardInfo::logDebug()
+{
+    LOG_DEBUG("EnvData for %08x", this->nodeNum);
+    //TODO
+}
+
 void InkHUD::EnvironmentDataApplet::onActivate()
 {
     // also display our own telemetry
     MeshModule::loopbackOk = true;
 
     // initialize our cards to show the telemetry Meshtastic already knows about
+    // note: air quality metrics are not retained in NodeDB AFAIK
 
-    std::deque<std::pair<NodeNum, meshtastic_EnvironmentMetrics>> lastNodesWithEnvData;
+    std::deque<std::pair<NodeNum, meshtastic_Telemetry>> lastNodesWithEnvData;
     const uint8_t max = maxCards();
 
     // getMeshNodeByIndex returns in last seen order with favorites on top - limit to max number we can show
     for (size_t i = 0; i < nodeDB->getNumMeshNodes() && lastNodesWithEnvData.size() < max; i++) {  
         const meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);  
         meshtastic_EnvironmentMetrics env;  
-        if (nodeDB->copyNodeEnvironment(n->num, env))  
-            lastNodesWithEnvData.emplace_back(n->num, env);
+        if (nodeDB->copyNodeEnvironment(n->num, env)) {
+            // contruct a telemetry here since we use this across the class
+            meshtastic_Telemetry tel;
+            tel.which_variant = meshtastic_Telemetry_environment_metrics_tag;
+            tel.variant.environment_metrics = env;
+            lastNodesWithEnvData.emplace_back(n->num, tel);
+        }
+            
     }
 
     LOG_INFO("%s initialized: %d nodes of %d with telemetry from NodeDB", this->MeshModule::name, 
@@ -74,30 +159,26 @@ ProcessMessage InkHUD::EnvironmentDataApplet::handleReceived(const meshtastic_Me
     meshtastic_Telemetry t;
     if (! (pb_decode_from_bytes(mp.decoded.payload.bytes, mp.decoded.payload.size,  
             &meshtastic_Telemetry_msg, &t))
-           && (t.which_variant == meshtastic_Telemetry_environment_metrics_tag)) {
+           && ((t.which_variant == meshtastic_Telemetry_environment_metrics_tag)
+              || (t.which_variant == meshtastic_Telemetry_air_quality_metrics_tag))) {
         return ProcessMessage::CONTINUE; // Let others look at this message also if they want    
     }
 
-    const auto &metrics = t.variant.environment_metrics;  
-
-    updateCard(mp.from, metrics);
+    updateCard(mp.from, t);
 
     return ProcessMessage::CONTINUE; // Let others look at this message also if they want
 }
     
-void InkHUD::EnvironmentDataApplet::updateCard(NodeNum from, const meshtastic_EnvironmentMetrics &metrics)
+void InkHUD::EnvironmentDataApplet::updateCard(NodeNum from, const meshtastic_Telemetry& telemetry)
 {
-    // we build a new EnvCardInfo here and discard the previous one
-    EnvCardInfo newCard;
-    newCard.nodeNum = from;
-
-    EnvCardInfo previousCard;
+    EnvCardInfo card;
     int previousPosition = -1; // index of previous card (if found)
     int pos = 0;
     // check whether we already have data about this node and remove it from list
     for (auto it = cards.begin(); it != cards.end(); ++it) {
-        if (it->nodeNum == newCard.nodeNum) {
-            previousCard = *it;
+        if (it->nodeNum == from) {
+            // retain old values for updating
+            card = *it;
             previousPosition = pos;
             // remove - we'll reinsert below
             cards.erase(it);
@@ -115,52 +196,20 @@ void InkHUD::EnvironmentDataApplet::updateCard(NodeNum from, const meshtastic_En
         return;
     }
 
-    newCard.isFavorite = nodeInfoLiteIsFavorite(node) || (from == nodeDB->getNodeNum());
+    bool isFavorite = nodeInfoLiteIsFavorite(node) || (from == nodeDB->getNodeNum());
 
-    std::string longName; // only used for logging right now
-    if (nodeInfoLiteHasUser(node))
-        longName = parse(node->long_name); // Found in nodeDB
-    else {
-        // Not found in nodeDB, show a hex nodeid instead
-        longName = hexifyNodeNum(from);
-    }
-
-    LOG_INFO("%s processing telemetry from %s %s", this->MeshModule::name, longName, newCard.isFavorite ? " (favorite)" : "");
-    boolean needsUpdate = (previousCard.nodeNum != 0) || (previousCard.isFavorite != newCard.isFavorite);
-    const meshtastic_EnvironmentMetrics &previousMetrics = previousCard.metrics;
-    
-    // use m.has_temperature / m.temperature, etc. to copy all metrics relevant to us to new card
-    if (metrics.has_temperature) {
-        newCard.metrics.temperature = metrics.temperature;
-        newCard.metrics.has_temperature = true;
-        needsUpdate |= (previousMetrics.temperature != newCard.metrics.temperature);
-    }
-    if (metrics.has_relative_humidity) {
-        newCard.metrics.relative_humidity = metrics.relative_humidity;
-        newCard.metrics.has_relative_humidity = true;
-        needsUpdate |= (previousMetrics.relative_humidity != newCard.metrics.relative_humidity);
-    }
-    if (metrics.has_barometric_pressure) {
-        newCard.metrics.barometric_pressure = metrics.barometric_pressure;
-        newCard.metrics.has_barometric_pressure = true;
-        needsUpdate |= (previousMetrics.barometric_pressure != newCard.metrics.barometric_pressure);
-    }
-    if (metrics.has_gas_resistance) {
-        newCard.metrics.has_gas_resistance = metrics.gas_resistance;
-        newCard.metrics.has_gas_resistance = true;
-        needsUpdate |= (previousMetrics.has_gas_resistance != newCard.metrics.has_gas_resistance);
-    }
-    if (metrics.has_iaq) {
-        newCard.metrics.iaq = metrics.iaq;
-        newCard.metrics.has_iaq = true;
-        needsUpdate |= (previousMetrics.iaq != newCard.metrics.iaq);
-    }
+    LOG_INFO("%s processing telemetry from !%08x %s", this->MeshModule::name, from, isFavorite ? " (favorite)" : "");
+    boolean needsUpdate = (card.nodeNum == 0) || (card.isFavorite != isFavorite);
+    // now copy new values (note: card might have been empty if we didn't have data for that node cached)
+    card.nodeNum = from;
+    card.isFavorite = isFavorite;
+    needsUpdate |= card.mergeTelemetry(telemetry);
 
     // look for correct position of card
     // favorites first (last seen first), then non-favorites
-    if (newCard.isFavorite) {
-        LOG_INFO("%s putting favorite %s on top", this->MeshModule::name, longName);
-        cards.push_front(newCard); // Store this CardInfo
+    if (card.isFavorite) {
+        LOG_INFO("%s putting favorite !%08x on top", this->MeshModule::name, from);
+        cards.push_front(card); // Store this CardInfo
     } else {
         pos = 0;
         auto it = cards.begin();
@@ -169,9 +218,9 @@ void InkHUD::EnvironmentDataApplet::updateCard(NodeNum from, const meshtastic_En
             ++it;
             ++pos;
         }
-        LOG_INFO("%s inserting updated card for %s at pos. %d", this->MeshModule::name, longName, pos);
+        LOG_INFO("%s inserting updated card for !%08x at pos. %d", this->MeshModule::name, from, pos);
         // insert after last favorite (which might be last card too)
-        cards.insert(it, newCard);
+        cards.insert(it, card);
         needsUpdate |= (pos != previousPosition);
     }
 
@@ -279,7 +328,7 @@ void InkHUD::EnvironmentDataApplet::onRender(bool full)
         std::string longName;  // handled below
         std::string shortName; // handled below
         String tempEtc = ""; // handled below
-        std::string iaq; // handled below
+        String airq = ""; // handled below
 
         meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(nodeNum);
 
@@ -307,21 +356,25 @@ void InkHUD::EnvironmentDataApplet::onRender(bool full)
             longName = hexifyNodeNum(nodeNum);
         }
 
-        if (card->metrics.has_temperature) {
-            tempEtc += String(card->metrics.temperature, 1) + "C";
+        if (card->has_temperature) {
+            tempEtc += String(card->temperature, 1) + "C";
         }
-        if (card->metrics.has_relative_humidity) {
+        if (card->has_relative_humidity) {
             if (tempEtc.length() > 0) { tempEtc += " "; }
-            tempEtc += String(card->metrics.relative_humidity, 1) + "%";
+            tempEtc += String(card->relative_humidity, 1) + "%";
         }
-        if (card->metrics.has_barometric_pressure) {
+        if (card->has_barometric_pressure) {
             if (tempEtc.length() > 0) { tempEtc += " "; }
-            tempEtc += String(card->metrics.barometric_pressure, 1) + "hPa";
+            tempEtc += String(card->barometric_pressure, 1) + "hPa";
         }
 
-        // IAQ
-        if (card->metrics.has_iaq) {
-            iaq = "IAQ "+to_string(card->metrics.iaq);
+        // AirQuality
+        if (card->has_co2) {
+            airq += String(card->co2)+"Co2";
+        }
+        if (card->has_iaq) {
+            if (airq.length() > 0) { airq += " ";}
+            airq += "IAQ "+String(card->iaq);
         }
 
         // Draw the info
@@ -341,16 +394,15 @@ void InkHUD::EnvironmentDataApplet::onRender(bool full)
         uint16_t rightContentW = 0;
 
         // Bottom row right: iaq.
-        if (!iaq.empty()) {
-            rightContentW = std::max(rightContentW, getTextWidth(iaq));
-            printAt(width() - 1, lineBY, iaq, RIGHT, MIDDLE);
+        if (airq.length() > 0) {
+            rightContentW = std::max(rightContentW, getTextWidth(airq.c_str()));
+            printAt(width() - 1, lineBY, airq.c_str(), RIGHT, MIDDLE);
         }
 
         // Top row right: temperature etc.
         if (tempEtc.length() > 0) {
             //rightContentW = std::max(rightContentW, getTextWidth(tempEtc.));
-            const std::string tempEtcStr(tempEtc.c_str());
-            printAt(width() - 1, lineAY, tempEtcStr, RIGHT, MIDDLE);
+            printAt(width() - 1, lineAY, tempEtc.c_str(), RIGHT, MIDDLE);
         }
 
         // Give long names as much room as possible while still avoiding right side
